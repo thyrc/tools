@@ -1,0 +1,203 @@
+#!/bin/bash
+#
+# Script by Jaco Kroon <jaco@uls.co.za> to setup an initrd for an encrypted
+# hard drive.
+#
+# Modified by Sven Volkinsfeld <sven.volkinsfeld@gmail.com> to build an 
+# initramfs for an encrypted LVM instead. And merged some ideas from 
+# http://jootamam.net/howto-basic-cryptsetup.htm.
+#
+# You are hereby given rights to reproduce this script in any way you see fit,
+# permitting that give credit to the original author, and provide a link to
+# the original material, and make any changes available under similar
+# conditions.
+
+set -o nounset
+
+###########
+# Variables
+###########
+
+kernel_version="${1:-4.8.14-hardened}"
+initram_file="initramfs-${kernel_version}"
+boot_dir="/boot"
+
+encdev="sda1"
+vgname="crypt"
+lvmroot="mapper/${vgname}-root"
+
+keydev="sdb1"
+keyiso="canter"
+
+###########
+# Functions
+###########
+
+# Takes multiple params, the first parameter is a description of the
+# action, the remainder is used as the command.
+function action() {
+    echo -n "$1: "
+    shift
+    outp="$("$@" 2>&1)"
+    res=$?
+    [[ $res -eq 0 ]] && echo "Success." && return 0
+    echo "Failed:"
+    echo "$outp"
+    exit $res
+}
+
+# Build an initramfs out of the files found in the first parameter dir.
+function build() {
+    cd "$1"
+    find . -print0 |cpio --null -o --quiet --format=newc |gzip -9 >"${boot_dir}/${initram_file}"
+}
+
+######
+# main
+######
+
+# Create a temporary directory which we can use to construct the initrd in.
+mp="$(mktemp -d /tmp/cryptrd-XXXXXX)"
+
+trap "rm -rf '$mp'; exit" INT ERR EXIT
+
+# A list of all the required binaries.
+binaries=(
+    /bin/busybox
+    /sbin/cryptsetup
+    /sbin/lvm
+)
+
+# Determine the ld-linux.so location. The path needs to be exact, this is
+# the only hard-coded so path in most binaries.
+ld=$(ldd $SHELL |grep -v '=>' |awk '/ld-musl/ { print $1 }')
+[[ ! -f "$ld" ]] && \
+    echo "Unable to determine location of ld-musl.so" && \
+    exit -1
+lib=$(dirname "$ld")
+
+action "Creating bin" mkdir "${mp}/bin"
+action "Creating $lib" mkdir "${mp}/${lib}"
+action "Creating proc" mkdir "${mp}/proc"
+action "Creating etc" mkdir "${mp}/etc"
+action "Creating sys" mkdir "${mp}/sys"
+action "Creating mnt" mkdir "${mp}/mnt"
+action "Creating newroot" mkdir "${mp}/newroot"
+
+action "Copying ld-musl" cp "$ld" "${mp}/${ld}"
+
+echo "Copying required binaries and their libraries:"
+for b in "${binaries[@]}"; do
+    action "  $b" install --strip "$b" "${mp}/bin/"
+    for l in $(ldd "$b" 2>/dev/null |awk '$2 == "=>" && $3 ~ "^/" { print $3 }'); do
+        action "   -> $l" install --strip "$l" "${mp}/${lib}/"
+    done
+done
+
+action "Creating busybox symlink" ln -s busybox "${mp}/bin/sh"
+
+action "Creating dev" mkdir "${mp}/dev"
+
+echo -n "Creating init file: "
+cat > "$mp/init" <<INITSRC
+#!/bin/busybox sh
+export PATH=/bin
+
+# Mount pseudo-file systems needed by init.
+mount -t devtmpfs none /dev
+mount -t proc none /proc
+mount -t sysfs none /sys
+
+# Give the kernel some time to find all devices.
+sleep 5
+
+# Disable kernel messages from popping onto the screen.
+echo 0 > /proc/sys/kernel/printk
+
+# Function for parsing command line options with "=" in them
+get_opt() {
+    echo "\$@" |cut -d '=' -f 2-
+}
+
+# Defaults
+enc_root="/dev/${encdev}"
+key_dev="/dev/${keydev}"
+key_iso="$keyiso"
+lvm_root="/dev/${lvmroot}"
+vg_name="$vgname"
+mount_opt="noatime"
+
+# Process command line options.
+for opt in \$(cat /proc/cmdline); do
+    case "\$opt" in
+        enc_root=*)
+            enc_root=\$(get_opt \$opt)
+            ;;
+        key_dev=*)
+            key_dev=\$(get_opt \$opt)
+            ;;
+        key_iso=*)
+            key_iso=\$(get_opt \$opt)
+            ;;
+        lvm_root=*)
+            lvm_root=\$(get_opt \$opt)
+            ;;
+        vg_name=*)
+            vg_name=\$(get_opt \$opt)
+            ;;
+        mount_opt=*)
+            mount_opt=\$(get_opt \$opt)
+            ;;
+    esac
+done
+
+# Mount pendrive / SD card if present
+[[ -b \${key_dev} ]] && mount \${key_dev} /mnt
+
+if [[ -f /mnt/\${key_iso} ]]
+then
+    # Obtain key material 
+    # losetup -r /dev/loop0 /mnt/\${key_iso}
+    cryptsetup open --type luks /mnt/\${key_iso} lukskey
+
+    # Open encrypted partition to create /dev/mapper/\${vg_name}.
+    cryptsetup --key-file /dev/mapper/lukskey open --type luks "\${enc_root}" "\${vg_name}"
+
+    # Close the key device & unmount pendrive / SD card
+    cryptsetup close lukskey
+    # losetup -d /dev/loop0
+    umount /mnt
+else
+    [[ -b \${key_dev} ]] && umount /mnt
+    # Same as before but without key-file
+    cryptsetup open --type luks "\${enc_root}" "\${vg_name}"
+fi
+
+# Get LVM volumes up.
+lvm vgchange -a y \$vg_name
+lvm vgscan --mknodes
+
+# Mount the root device.
+mount -o \${mount_opt} "\${lvm_root}" /newroot
+
+#Unmount all other mounts so that the ram used by
+#the initramfs can be cleared after switch_root
+umount /sys /proc /dev
+
+clear
+
+# Switch to the new root and execute init.
+if [[ -x "/newroot/sbin/init" ]]
+then
+    exec switch_root /newroot /sbin/init
+fi
+
+# This will only be run if the above lines failed.
+echo "Failed to switch_root, dropping to a shell"
+exec /bin/sh
+INITSRC
+echo "Success."
+
+action "Fixing permissions on init" chmod 755 "${mp}/init"
+
+action "Building initramfs ${boot_dir}/${initram_file}" build "${mp}"
