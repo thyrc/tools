@@ -1,0 +1,97 @@
+#!/bin/bash
+
+set -eu
+
+PATH=/usr/bin:/usr/sbin:/bin:/sbin
+
+script_canon="$(readlink -m $0)"
+absolute_path="$(dirname $script_canon)"
+pushd "$absolute_path" >/dev/null
+
+script_name="${0##*/}"
+lock_file="/tmp/${script_name}.lock"
+
+UPDATE=''
+EMERGE='emerge -uvpND --with-bdeps=y --complete-graph=y'
+KEEPGOING=''
+CLEANUP=''
+EXCLUDE=''
+
+UPGRADE_TMPFS=':'
+REMOUNT_TMPFS=':'
+
+COMMAND='export DONT_MOUNT_BOOT=true; UPDATE EMERGE KEEPGOING EXCLUDE @world CLEANUP'
+
+###############
+# basic locking
+###############
+
+if (set -o noclobber; echo "$$" >"$lock_file") 2>/dev/null
+then
+    trap 'rm -f "$lock_file"; exit $?' INT TERM EXIT
+else
+    >&2 echo "Failed to acquire lock: '$lock_file'."
+    >&2 echo "Held by PID $(cat "$lock_file")"
+    exit 1
+fi
+
+usage () {
+    cat <<USAGE
+Usage: $script_name
+
+  --update, -u     eix-sync
+  --pretend, -p    simply display what *would* have been installed
+  --commit, -c     really update
+  --exclude, -e    exclude (single) ATOM
+  --keepgoing, -k  add --keep-going=y to emerge
+USAGE
+    exit
+}
+
+while [[ "$#" -gt 0 ]]
+do
+    case "$1" in
+        --update | -u )
+            UPDATE='echo 'Updating...'; eix-sync -q; layman -q -S >/dev/null &&'
+            shift
+            ;;
+        --pretend | -p )
+            EMERGE='emerge -uvpND --with-bdeps=y --complete-graph=y --backtrack=30'
+            CLEANUP='&& emerge -cp --verbose=n'
+            shift
+            ;;
+        --keepgoing | -k )
+            KEEPGOING='--keep-going=y'
+            shift
+            ;;
+        --commit | -c )
+            EMERGE='emerge -uvND --with-bdeps=y --complete-graph=y --backtrack=30'
+            CLEANUP='&& emerge -c --verbose=n && emerge @preserved-rebuild'
+            UPGRADE_TMPFS='mount -o remount,size=12G /var/tmp/portage'
+            REMOUNT_TMPFS='mount -o remount /var/tmp/portage'
+            shift
+            ;;
+        --exclude | -e )
+            shift
+            EXCLUDE="$EXCLUDE --exclude $1"
+            shift
+            ;;
+        -- )
+            shift
+            break
+            ;;
+        * )
+            usage
+            ;;
+    esac
+done
+
+COMMAND=${COMMAND//UPDATE/$UPDATE}
+COMMAND=${COMMAND//EMERGE/$EMERGE}
+COMMAND=${COMMAND//KEEPGOING/$KEEPGOING}
+COMMAND=${COMMAND//EXCLUDE/$EXCLUDE}
+COMMAND=${COMMAND//CLEANUP/$CLEANUP}
+
+sudo bash -c "$UPGRADE_TMPFS; $COMMAND; $REMOUNT_TMPFS"
+
+popd >/dev/null
