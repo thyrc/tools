@@ -22,11 +22,11 @@ kernel_version="${1:-4.8.14-hardened}"
 initram_file="initramfs-${kernel_version}"
 boot_dir="/boot"
 
-encdev="sda1"
+encdev="sdb1"
 vgname="crypt"
 lvmroot="mapper/${vgname}-root"
 
-keydev="sdb1"
+keydev="sdc1"
 keyiso="canter"
 
 ###########
@@ -76,10 +76,13 @@ ld=$(ldd $SHELL |grep -v '=>' |awk '/ld-musl/ { print $1 }')
     exit -1
 lib=$(dirname "$ld")
 
+action "Creating etc" mkdir "${mp}/etc"
+action "Creating etc/lvm" mkdir "${mp}/etc/lvm"
 action "Creating bin" mkdir "${mp}/bin"
 action "Creating $lib" mkdir "${mp}/${lib}"
+action "Creating /lib/firmware" mkdir -p "${mp}/lib/firmware"
+action "Creating dev" mkdir "${mp}/dev"
 action "Creating proc" mkdir "${mp}/proc"
-action "Creating etc" mkdir "${mp}/etc"
 action "Creating sys" mkdir "${mp}/sys"
 action "Creating mnt" mkdir "${mp}/mnt"
 action "Creating newroot" mkdir "${mp}/newroot"
@@ -94,9 +97,9 @@ for b in "${binaries[@]}"; do
     done
 done
 
-action "Creating busybox symlink" ln -s busybox "${mp}/bin/sh"
+action "Copying firmware files" cp -r /lib/firmware/i915 "${mp}/lib/firmware"
 
-action "Creating dev" mkdir "${mp}/dev"
+action "Creating busybox symlink" ln -s busybox "${mp}/bin/sh"
 
 echo -n "Creating init file: "
 cat > "$mp/init" <<INITSRC
@@ -174,7 +177,7 @@ else
 fi
 
 # Get LVM volumes up.
-lvm vgchange -a y \$vg_name
+lvm vgchange --activate y --noudevsync \$vg_name
 lvm vgscan --mknodes
 
 # Mount the root device.
@@ -196,6 +199,30 @@ fi
 echo "Failed to switch_root, dropping to a shell"
 exec /bin/sh
 INITSRC
+echo "Success."
+
+echo -n "Creating lvm.conf file: "
+cat > "$mp/etc/lvm/lvm.conf" <<LVMCONFSRC
+devices {
+    obtain_device_list_from_udev = 0
+    external_device_info_source = "none"
+
+    multipath_component_detection = 0
+    md_component_detection = 0
+
+    issue_discards = 1
+}
+
+global {
+    use_lvmetad = 0
+}
+
+activation {
+    udev_sync = 0
+    udev_rules = 0
+    verify_udev_operations = 0
+}
+LVMCONFSRC
 echo "Success."
 
 action "Fixing permissions on init" chmod 755 "${mp}/init"
